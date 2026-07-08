@@ -62,6 +62,21 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
 
 logger = logging.getLogger(__name__)
 
+_SLACK_USER_MENTION_RE = re.compile(r"<@([A-Z0-9_]+)(?:\|[^>]+)?>")
+
+
+def _extract_slack_user_mentions(text: str) -> set[str]:
+    """Return Slack user IDs explicitly mentioned in ``text``.
+
+    Slack encodes user mentions as ``<@U123>`` or ``<@U123|display>``.  This
+    helper intentionally ignores speaker prefixes, channel metadata, URLs, and
+    plain ``@name`` text so routing decisions key off real Slack mentions only.
+    """
+    if not text:
+        return set()
+    return set(_SLACK_USER_MENTION_RE.findall(text))
+
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -2823,16 +2838,23 @@ class SlackAdapter(BasePlatformAdapter):
         #   2. The message is a reply in a thread the bot started/participated in, OR
         #   3. The message is in a thread where the bot was previously @mentioned, OR
         #   4. There's an existing session for this thread (survives restarts)
-        bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
+        bot_uid = self._resolve_bot_user_id_for_event(team_id)
         routing_text = original_text or ""
-        is_mentioned = bool(
-            (bot_uid and f"<@{bot_uid}>" in routing_text)
-            or self._slack_message_matches_mention_patterns(routing_text)
+        mentioned_user_ids = _extract_slack_user_mentions(routing_text)
+        is_slack_mentioned = bool(bot_uid and bot_uid in mentioned_user_ids)
+        matches_mention_pattern = self._slack_message_matches_mention_patterns(
+            routing_text
+        )
+        is_mentioned = is_slack_mentioned or matches_mention_pattern
+        mentions_other_without_bot = self._slack_message_mentions_other_without_bot(
+            routing_text,
+            bot_uid=bot_uid,
+            bot_name_mentioned=matches_mention_pattern,
         )
         event_thread_ts = event.get("thread_ts")
         is_thread_reply = bool(event_thread_ts and event_thread_ts != ts)
 
-        if not is_one_to_one_dm and bot_uid:
+        if not is_one_to_one_dm:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
             if allowed_channels and channel_id not in allowed_channels:
@@ -2841,35 +2863,59 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
+            if mentions_other_without_bot:
+                logger.debug(
+                    "[Slack] Ignoring message that mentions another user but not "
+                    "the bot: channel=%s thread_ts=%s team=%s",
+                    channel_id,
+                    event_thread_ts or "",
+                    team_id or "",
+                )
+                return
+
             if channel_id in self._slack_free_response_channels():
                 pass  # Free-response channel — always process
             elif not self._slack_require_mention():
                 pass  # Mention requirement disabled globally for Slack
-            elif self._slack_strict_mention() and not is_mentioned:
-                return  # Strict mode: ignore until @-mentioned again
-            elif not is_mentioned:
-                reply_to_bot_thread = (
-                    is_thread_reply and event_thread_ts in self._bot_message_ts
-                )
-                in_mentioned_thread = (
-                    event_thread_ts is not None
-                    and event_thread_ts in self._mentioned_threads
-                )
-                has_session = is_thread_reply and self._has_active_session_for_thread(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
-                )
-                if (
-                    not reply_to_bot_thread
-                    and not in_mentioned_thread
-                    and not has_session
-                ):
+            else:
+                if not bot_uid:
+                    logger.debug(
+                        "[Slack] Ignoring shared-surface message because bot identity "
+                        "is unresolved: channel=%s thread_ts=%s team=%s",
+                        channel_id,
+                        event_thread_ts or "",
+                        team_id or "",
+                    )
                     return
 
+                if self._slack_strict_mention() and not is_mentioned:
+                    return  # Strict mode: ignore until @-mentioned again
+                elif not is_mentioned:
+                    reply_to_bot_thread = (
+                        is_thread_reply and event_thread_ts in self._bot_message_ts
+                    )
+                    in_mentioned_thread = (
+                        event_thread_ts is not None
+                        and event_thread_ts in self._mentioned_threads
+                    )
+                    has_session = is_thread_reply and self._has_active_session_for_thread(
+                        channel_id=channel_id,
+                        thread_ts=event_thread_ts,
+                        user_id=user_id,
+                    )
+                    if (
+                        not reply_to_bot_thread
+                        and not in_mentioned_thread
+                        and not has_session
+                    ):
+                        return
+
         if is_mentioned:
-            # Strip the bot mention from the text
-            text = text.replace(f"<@{bot_uid}>", "").strip()
+            # Strip only the real bot mention from the text. Wake-word patterns
+            # can also count as mentions, but they must not strip or mutate
+            # mentions of other Slack users.
+            if is_slack_mentioned:
+                text = text.replace(f"<@{bot_uid}>", "").strip()
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict mode: strict_mention=true bots must be
             # re-mentioned every turn, so remembering the thread would
@@ -4152,6 +4198,39 @@ class SlackAdapter(BasePlatformAdapter):
                     raise
 
     # ── Channel mention gating ─────────────────────────────────────────────
+
+    def _resolve_bot_user_id_for_event(self, team_id: Optional[str]) -> Optional[str]:
+        """Resolve the bot user ID for a Slack event.
+
+        Multi-workspace installs must key by the event's team_id.  Fall back to
+        the primary bot ID for legacy/single-workspace payloads, but never infer
+        identity from the message text itself.
+        """
+        if team_id:
+            team_bot_uid = self._team_bot_user_ids.get(team_id)
+            if team_bot_uid:
+                return team_bot_uid
+        return self._bot_user_id
+
+    def _slack_message_mentions_other_without_bot(
+        self,
+        text: str,
+        *,
+        bot_uid: Optional[str],
+        bot_name_mentioned: bool = False,
+    ) -> bool:
+        """Return True for ``@someone_else`` messages that do not address us.
+
+        A configured mention pattern (for example ``hey hermes``) counts as
+        addressing the bot by name, so ``@alice hey hermes`` is allowed.  A Slack
+        user mention alone must match the current bot user ID from ``auth.test``.
+        """
+        mentioned_user_ids = _extract_slack_user_mentions(text)
+        if not mentioned_user_ids:
+            return False
+        if bot_uid and bot_uid in mentioned_user_ids:
+            return False
+        return not bot_name_mentioned
 
     def _slack_require_mention(self) -> bool:
         """Return whether channel messages require an explicit bot mention.
