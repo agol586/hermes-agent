@@ -2871,6 +2871,49 @@ class TestThreadReplyHandling:
         assert msg_event.text == "thanks for the help"
 
     @pytest.mark.asyncio
+    async def test_thread_reply_mentioning_other_user_is_ignored_even_with_session(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """A thread continuation must stay silent when it @mentions someone else."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "<@U_OTHER> can you review?",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_thread_reply_mentioning_other_and_bot_is_processed(
+        self, adapter_with_session_store, mock_session_store
+    ):
+        """A message that @mentions the real bot is addressed even with other mentions."""
+        session_key = "agent:main:slack:group:C123:123.000:U_USER"
+        mock_session_store._entries = {session_key: MagicMock()}
+
+        event = {
+            "text": "<@U_OTHER> <@U_BOT> compare both options",
+            "user": "U_USER",
+            "channel": "C123",
+            "ts": "123.456",
+            "thread_ts": "123.000",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+        }
+        await adapter_with_session_store._handle_slack_message(event)
+        adapter_with_session_store.handle_message.assert_called_once()
+        msg_event = adapter_with_session_store.handle_message.call_args[0][0]
+        assert "<@U_BOT>" not in msg_event.text
+        assert "<@U_OTHER>" in msg_event.text
+
+    @pytest.mark.asyncio
     async def test_top_level_message_requires_mention_even_with_session(
         self, adapter_with_session_store, mock_session_store
     ):

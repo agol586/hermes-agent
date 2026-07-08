@@ -44,7 +44,10 @@ _ensure_slack_mock()
 import plugins.platforms.slack.adapter as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
-from plugins.platforms.slack.adapter import SlackAdapter  # noqa: E402
+from plugins.platforms.slack.adapter import (  # noqa: E402
+    SlackAdapter,
+    _extract_slack_user_mentions,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +79,64 @@ def _make_adapter(require_mention=None, strict_mention=None, free_response_chann
     adapter._bot_user_id = BOT_USER_ID
     adapter._team_bot_user_ids = {}
     return adapter
+
+
+# ---------------------------------------------------------------------------
+# Tests: Slack mention extraction and bot identity helpers
+# ---------------------------------------------------------------------------
+
+def test_extract_slack_user_mentions_plain_and_labeled_forms():
+    assert _extract_slack_user_mentions("<@U03DRECMG0P> look") == {"U03DRECMG0P"}
+    assert _extract_slack_user_mentions("<@U1|alice> <@U2>") == {"U1", "U2"}
+
+
+def test_extract_slack_user_mentions_ignores_metadata_and_urls():
+    assert _extract_slack_user_mentions("[Jun Luo] look") == set()
+    assert _extract_slack_user_mentions("see <https://example.com|site>") == set()
+
+
+def test_resolve_bot_user_id_prefers_team_specific_mapping():
+    adapter = _make_adapter()
+    adapter._bot_user_id = "U_PRIMARY"
+    adapter._team_bot_user_ids = {"T1": "U_TEAM"}
+
+    assert adapter._resolve_bot_user_id_for_event("T1") == "U_TEAM"
+
+
+def test_resolve_bot_user_id_falls_back_to_primary():
+    adapter = _make_adapter()
+    adapter._bot_user_id = "U_PRIMARY"
+    adapter._team_bot_user_ids = {}
+
+    assert adapter._resolve_bot_user_id_for_event("T_UNKNOWN") == "U_PRIMARY"
+
+
+def test_mentions_other_without_bot_detects_other_user_only():
+    adapter = _make_adapter()
+    assert adapter._slack_message_mentions_other_without_bot(
+        "<@U03DRECMG0P> look", bot_uid="U048VF49ELF"
+    ) is True
+
+
+def test_mentions_other_without_bot_allows_real_bot_mention():
+    adapter = _make_adapter()
+    assert adapter._slack_message_mentions_other_without_bot(
+        "<@U03DRECMG0P> look", bot_uid="U03DRECMG0P"
+    ) is False
+
+
+def test_mentions_other_without_bot_allows_mixed_mentions_with_bot():
+    adapter = _make_adapter()
+    assert adapter._slack_message_mentions_other_without_bot(
+        "<@U03DRECMG0P> <@U048VF49ELF> look", bot_uid="U048VF49ELF"
+    ) is False
+
+
+def test_mentions_other_without_bot_allows_textual_bot_wake_pattern():
+    adapter = _make_adapter()
+    assert adapter._slack_message_mentions_other_without_bot(
+        "<@U03DRECMG0P> hey hermes", bot_uid="U048VF49ELF", bot_name_mentioned=True
+    ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -260,31 +321,46 @@ def _would_process(adapter, *, is_dm=False, channel_id=CHANNEL_ID,
         channel_type = "im" if is_dm else ""
     is_one_to_one_dm = channel_type == "im"
 
-    bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
+    bot_uid = adapter._resolve_bot_user_id_for_event("T1")
     if mentioned:
         text = f"<@{bot_uid}> {text}"
-    is_mentioned = bool(
-        (bot_uid and f"<@{bot_uid}>" in text)
-        or adapter._slack_message_matches_mention_patterns(text)
-    )
+    mentioned_user_ids = _extract_slack_user_mentions(text)
+    is_slack_mentioned = bool(bot_uid and bot_uid in mentioned_user_ids)
+    matches_mention_pattern = adapter._slack_message_matches_mention_patterns(text)
+    is_mentioned = is_slack_mentioned or matches_mention_pattern
 
-    if not is_one_to_one_dm and bot_uid:
+    if not is_one_to_one_dm:
         # allowed_channels check (whitelist — must pass before other gating)
         allowed = adapter._slack_allowed_channels()
         if allowed and channel_id not in allowed:
+            return False
+
+        if adapter._slack_message_mentions_other_without_bot(
+            text,
+            bot_uid=bot_uid,
+            bot_name_mentioned=matches_mention_pattern,
+        ):
             return False
 
         if channel_id in adapter._slack_free_response_channels():
             return True
         elif not adapter._slack_require_mention():
             return True
-        elif adapter._slack_strict_mention() and not is_mentioned:
-            return False
-        elif not is_mentioned:
-            if thread_reply and active_session:
-                return True
-            else:
+        else:
+            if not bot_uid:
                 return False
+            if adapter._slack_strict_mention() and not is_mentioned:
+                return False
+            elif not is_mentioned:
+                reply_to_bot_thread = thread_reply and "THREAD_TS" in getattr(
+                    adapter, "_bot_message_ts", set()
+                )
+                in_mentioned_thread = thread_reply and "THREAD_TS" in getattr(
+                    adapter, "_mentioned_threads", set()
+                )
+                has_session = thread_reply and active_session
+                if not (reply_to_bot_thread or in_mentioned_thread or has_session):
+                    return False
     return True
 
 
@@ -429,29 +505,68 @@ def test_thread_reply_without_active_session_ignored():
     ) is False
 
 
-def test_bot_uid_none_processes_channel_message():
-    """When bot_uid is None (before auth_test), channel messages pass through.
+def test_thread_reply_with_active_session_mentioning_other_user_ignored():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter,
+        text="<@U03DRECMG0P> can you review?",
+        thread_reply=True,
+        active_session=True,
+    ) is False
 
-    This preserves the old behavior: the gating block is skipped entirely
-    when bot_uid is falsy, so messages are not silently dropped during
-    startup or for new workspaces.
+
+def test_thread_reply_with_active_session_mentioning_real_bot_processed():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter,
+        text="<@U_BOT_123> look",
+        thread_reply=True,
+        active_session=True,
+    ) is True
+
+
+def test_thread_reply_with_active_session_mentioning_other_and_bot_processed():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter,
+        text="<@U03DRECMG0P> <@U_BOT_123> compare both",
+        thread_reply=True,
+        active_session=True,
+    ) is True
+
+
+def test_channel_message_mentioning_other_user_ignored_even_with_active_session():
+    adapter = _make_adapter(require_mention=True)
+    assert _would_process(
+        adapter,
+        text="<@U03DRECMG0P> look",
+        thread_reply=False,
+        active_session=True,
+    ) is False
+
+
+def test_channel_message_mentioning_other_user_with_textual_bot_pattern_processed():
+    adapter = _make_adapter(require_mention=True, mention_patterns=["hey hermes"])
+    assert _would_process(
+        adapter,
+        text="<@U03DRECMG0P> hey hermes",
+        thread_reply=False,
+        active_session=False,
+    ) is True
+
+
+def test_bot_uid_none_ignores_shared_surface_message():
+    """If bot identity is unresolved, shared surfaces fail closed.
+
+    A channel/thread message cannot be proven to mention the current bot until
+    ``auth_test()`` has resolved the bot user ID. DMs remain exempt elsewhere.
     """
     adapter = _make_adapter(require_mention=True)
     adapter._bot_user_id = None
     adapter._team_bot_user_ids = {}
 
-    # With bot_uid=None, the `if not is_dm and bot_uid:` condition is False,
-    # so the gating block is skipped — message passes through.
-    bot_uid = adapter._team_bot_user_ids.get("T1", adapter._bot_user_id)
-    assert bot_uid is None
-
-    # Simulate: gating block not entered when bot_uid is falsy
-    is_dm = False
-    if not is_dm and bot_uid:
-        result = False  # would enter gating
-    else:
-        result = True  # gating skipped, message processed
-    assert result is True
+    assert adapter._resolve_bot_user_id_for_event("T1") is None
+    assert _would_process(adapter, text="hello", channel_type="") is False
 
 
 # ---------------------------------------------------------------------------
